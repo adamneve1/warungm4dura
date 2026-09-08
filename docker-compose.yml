@@ -1,0 +1,7 @@
+services:
+  warung-agent:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./credentials:/app/credentials:ro

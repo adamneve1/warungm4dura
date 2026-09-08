@@ -1,0 +1,7 @@
+google-api-python-client>=2.180,<3
+google-auth>=2.40,<3
+python-dotenv>=1.1,<2
+pytest>=8.3,<9
+mcp>=2.0,<3
+google-genai>=1.30,<2
+python-telegram-bot>=22.0,<23
