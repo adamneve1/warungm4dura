@@ -1,6 +1,7 @@
 """Telegram text adapter; no business logic belongs here."""
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,6 +16,27 @@ logger = logging.getLogger(__name__)
 
 # Explicit map: casefold → canonical payment method as expected by TransactionService
 _PAYMENT_MAP: dict[str, str] = {"tunai": "Tunai", "transfer": "Transfer", "qris": "QRIS"}
+
+# Cancel synonyms — deterministic word-level patterns covering common Indonesian variations.
+# These only fire when there is an active pending transaction.
+_CANCEL_PATTERNS: tuple[re.Pattern, ...] = tuple(
+    re.compile(r"\b" + p + r"\b", re.IGNORECASE)
+    for p in [
+        r"batal",
+        r"cancel",
+        r"ga\s+jadi",
+        r"gajadi",
+        r"nggak\s+jadi",
+        r"ngga\s+jadi",
+        r"enggak\s+jadi",
+        r"tidak\s+jadi",
+    ]
+)
+
+
+def _is_cancel(text: str) -> bool:
+    """Return True if text contains a cancel intent keyword (word-boundary safe)."""
+    return any(p.search(text) for p in _CANCEL_PATTERNS)
 
 
 def _match_candidates(selection: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -89,13 +111,16 @@ class TelegramBot:
         chat_id = effective_chat.id if effective_chat else update.message.chat_id
         now = datetime.now(timezone.utc)
         pending = self._states.get(chat_id, now)
-        normalized = update.message.text.strip().casefold()
+        raw_text = update.message.text
 
-        # Guard 1: cancel — clears any pending state regardless of status
-        if pending and normalized in {"batal", "cancel"}:
+        # Guard 1: cancel — works for any pending status.
+        # Uses synonym patterns so "ga jadi", "nggak jadi", etc. all cancel.
+        if pending and _is_cancel(raw_text):
             self._states.clear(chat_id)
             await update.message.reply_text("Siap Bos, transaksi dibatalkan.")
             return
+
+        normalized = raw_text.strip().casefold()
 
         # Guard 2: product disambiguation — only when WAITING_PRODUCT.
         # Candidate matching is attempted first. If no candidate matches, the message is
@@ -108,7 +133,7 @@ class TelegramBot:
                 return
             # Not a product selection → process as other intent, keep pending intact
             try:
-                response = self._model.respond(update.message.text, f"telegram:{update_id}")
+                response = self._model.respond(raw_text, f"telegram:{update_id}")
             except Exception:
                 logger.exception("Telegram request failed for update %s", update_id)
                 response = "Maaf, terjadi gangguan saat memproses pesan."
@@ -136,11 +161,11 @@ class TelegramBot:
             intent = None
             resolver = getattr(self._model, "resolve_transaction_intent", None)
             if self._transaction_adapter is not None and resolver is not None:
-                intent = resolver(update.message.text)
+                intent = resolver(raw_text)
             if intent and intent.get("intent") == "sale":
                 response = await self._handle_sale_intent(update, chat_id, intent, update_id, now)
             else:
-                response = self._model.respond(update.message.text, f"telegram:{update_id}")
+                response = self._model.respond(raw_text, f"telegram:{update_id}")
         except Exception:
             logger.exception("Telegram request failed for update %s", update_id)
             response = "Maaf, terjadi gangguan saat memproses pesan."
@@ -171,9 +196,14 @@ class TelegramBot:
             return False
 
         if len(matched) > 1:
-            # Still ambiguous — narrow candidates and ask again
+            # Still ambiguous — narrow candidates and ask again, preserving qty/unit
             narrowed_unresolved = [
-                UnresolvedItem(current.original_query, current.qty, matched),
+                UnresolvedItem(
+                    original_query=current.original_query,
+                    qty=current.qty,
+                    candidates=matched,
+                    unit=current.unit,
+                ),
                 *pending.unresolved[1:],
             ]
             self._states.put(chat_id, PendingTransaction(
@@ -189,7 +219,7 @@ class TelegramBot:
             )
             return True
 
-        # Exactly 1 match — item resolved
+        # Exactly 1 match — item resolved; qty preserved from UnresolvedItem
         resolved_item = {"product_id": matched[0]["product_id"], "qty": current.qty}
         new_items = [*pending.items, resolved_item]
         new_unresolved = pending.unresolved[1:]
@@ -246,12 +276,13 @@ class TelegramBot:
             if intent.get("error_code") == "AMBIGUOUS_PRODUCT":
                 unresolved_raw = intent.get("unresolved_items", [])
                 if unresolved_raw:
-                    # Build state for product disambiguation
+                    # Build state for product disambiguation; preserve qty and unit
                     unresolved = [
                         UnresolvedItem(
                             original_query=u["original_query"],
                             qty=u["qty"],
                             candidates=u["candidates"],
+                            unit=u.get("unit"),
                         )
                         for u in unresolved_raw
                     ]

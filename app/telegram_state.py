@@ -9,9 +9,10 @@ from typing import Any
 class UnresolvedItem:
     """An item whose product could not be uniquely resolved due to multiple candidates."""
 
-    original_query: str               # e.g. "indomie" — used in disambiguation prompts
+    original_query: str               # e.g. "sarimie" — used in disambiguation prompts
     qty: int
-    candidates: list[dict[str, Any]]  # [{product_id, nama}] — the subset to match against
+    candidates: list[dict[str, Any]]  # [{product_id, nama, satuan}] — subset to match against
+    unit: str | None = None           # satuan from user message, e.g. "butir", "kg", "bungkus"
 
 
 @dataclass

@@ -69,7 +69,7 @@ class GeminiService:
                     "type": "OBJECT",
                     "properties": {
                         "intent": {"type": "STRING", "enum": ["sale", "other"]},
-                        "items": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"product_query": {"type": "STRING"}, "qty": {"type": "INTEGER"}}}},
+                        "items": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"product_query": {"type": "STRING"}, "qty": {"type": "INTEGER"}, "unit": {"type": "STRING"}}}},
                         "payment_method": {"type": "STRING"},
                     },
                     "required": ["intent", "items"],
@@ -88,7 +88,16 @@ class GeminiService:
         for item in parsed.get("items", []):
             query = str(item.get("product_query", ""))
             qty = int(item.get("qty") or 1)
-            matches = self._tools.search_product(query)
+            unit = str(item.get("unit") or "").strip().casefold() or None
+            raw_matches = self._tools.search_product(query)
+            # Deduplicate by product_id — Sheets may return same row twice
+            seen_ids: set[str] = set()
+            matches = []
+            for m in raw_matches:
+                pid = m.get("product_id", "")
+                if pid not in seen_ids:
+                    seen_ids.add(pid)
+                    matches.append(m)
             if len(matches) == 0:
                 return {
                     "intent": "sale",
@@ -99,14 +108,26 @@ class GeminiService:
             if len(matches) == 1:
                 resolved_items.append({"product_id": matches[0]["product_id"], "qty": qty})
             else:
-                # Multiple candidates — collect for user disambiguation; do not pick arbitrarily
+                # Multiple candidates — attempt unit-aware auto-resolution first
+                candidates = [
+                    {"product_id": m["product_id"], "nama": m["nama"], "satuan": m.get("satuan", "")}
+                    for m in matches
+                ]
+                if unit:
+                    unit_matched = [
+                        c for c in candidates
+                        if c["satuan"].casefold() == unit
+                    ]
+                    if len(unit_matched) == 1:
+                        # Unit uniquely identifies the product — resolve automatically
+                        resolved_items.append({"product_id": unit_matched[0]["product_id"], "qty": qty})
+                        continue  # do not add to unresolved_items
+                # Still ambiguous — defer to user disambiguation
                 unresolved_items.append({
                     "original_query": query,
                     "qty": qty,
-                    "candidates": [
-                        {"product_id": m["product_id"], "nama": m["nama"]}
-                        for m in matches
-                    ],
+                    "unit": unit,
+                    "candidates": candidates,
                 })
         if unresolved_items:
             return {

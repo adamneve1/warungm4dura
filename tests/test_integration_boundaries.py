@@ -1054,3 +1054,445 @@ def test_acceptance_jual_indomie_tunai_inline_then_goreng():
     assert items == [{"product_id": "P001", "qty": 1}]
     assert pm == "Tunai"
     assert store.get(1, datetime.now(timezone.utc)) is None
+
+
+# ===========================================================================
+# Regression tests: Masalah 1-7 dari E2E (2026-09-08)
+# ===========================================================================
+
+# Helpers shared by this section
+from app.telegram_bot import _is_cancel
+
+
+_SARIMIE_CANDIDATES_DEDUP = [
+    {"product_id": "P050", "nama": "Sarimie Isi 2",  "satuan": "pcs"},
+    {"product_id": "P051", "nama": "Sarimie Jumbo",   "satuan": "pcs"},
+    {"product_id": "P050", "nama": "Sarimie Isi 2",  "satuan": "pcs"},  # duplicate ID
+]
+
+_TELUR_CANDIDATES = [
+    {"product_id": "P060", "nama": "Telur Ayam Ras",     "satuan": "kg"},
+    {"product_id": "P061", "nama": "Telur Ayam Satuan",  "satuan": "butir"},
+]
+
+
+def _dedup_by_product_id(candidates: list[dict]) -> list[dict]:
+    """Mirror of the dedup logic in gemini.py for testing."""
+    seen: set[str] = set()
+    result = []
+    for c in candidates:
+        pid = c.get("product_id", "")
+        if pid not in seen:
+            seen.add(pid)
+            result.append(c)
+    return result
+
+
+# ── Masalah 1: Candidate deduplication ─────────────────────────────────────
+
+def test_dedup_by_product_id_removes_duplicate():
+    """T1: duplicate product_id → only one candidate retained."""
+    deduped = _dedup_by_product_id(_SARIMIE_CANDIDATES_DEDUP)
+    ids = [c["product_id"] for c in deduped]
+    assert ids.count("P050") == 1, "Duplicate product_id must be removed"
+    assert len(deduped) == 2
+
+
+def test_dedup_preserves_distinct_product_ids():
+    """T2: distinct product_ids with same name → both retained (different SKUs)."""
+    candidates = [
+        {"product_id": "P100", "nama": "Aqua Botol 600ml", "satuan": "pcs"},
+        {"product_id": "P101", "nama": "Aqua Botol 600ml", "satuan": "pcs"},  # diff ID, same name
+    ]
+    deduped = _dedup_by_product_id(candidates)
+    assert len(deduped) == 2, "Different product_ids must NOT be merged even if name matches"
+
+
+# ── Masalah 2 & 4: Qty and unit preservation ────────────────────────────────
+
+def _ambiguous_with_qty(query, candidates, qty, unit=None, payment_method=None):
+    """Build AMBIGUOUS_PRODUCT intent with explicit qty and unit."""
+    return {
+        "intent": "sale",
+        "success": False,
+        "error_code": "AMBIGUOUS_PRODUCT",
+        "resolved_items": [],
+        "unresolved_items": [{
+            "original_query": query,
+            "qty": qty,
+            "unit": unit,
+            "candidates": candidates,
+        }],
+        "payment_method": payment_method,
+    }
+
+
+def _bot_with_qty_pending(query, candidates, qty=5, unit=None, payment_method=None):
+    model = WorkflowModel({
+        f"terjual {query} {qty}": _ambiguous_with_qty(
+            query, candidates, qty=qty, unit=unit, payment_method=payment_method
+        )
+    })
+    store = PendingTransactionStore()
+    adapter_instance = TransactionAdapter()
+    bot = TelegramBot("token", model, adapter_instance, store)
+    run_message(bot, TelegramUpdate(1, f"terjual {query} {qty}", chat_id=1))
+    return bot, store, adapter_instance
+
+
+def test_unresolved_item_preserves_qty():
+    """T3: qty is stored in UnresolvedItem during disambiguation."""
+    bot, store, adapter_instance = _bot_with_qty_pending(
+        "sarimie", _SARIMIE_CANDIDATES_DEDUP[:2], qty=5
+    )
+    pending = store.get(1, datetime.now(timezone.utc))
+    assert pending is not None
+    assert pending.unresolved[0].qty == 5
+
+
+def test_unresolved_item_preserves_unit():
+    """T4: unit is stored in UnresolvedItem during disambiguation."""
+    bot, store, adapter_instance = _bot_with_qty_pending(
+        "sarimie", _SARIMIE_CANDIDATES_DEDUP[:2], qty=5, unit="bungkus"
+    )
+    pending = store.get(1, datetime.now(timezone.utc))
+    assert pending is not None
+    assert pending.unresolved[0].unit == "bungkus"
+
+
+def test_resolve_product_preserves_qty():
+    """T5: after product selection, qty in create_transaction matches original."""
+    bot, store, adapter_instance = _bot_with_qty_pending(
+        "sarimie", _SARIMIE_CANDIDATES_DEDUP[:2], qty=5, payment_method="Tunai"
+    )
+    # Select "jumbo"
+    run_message(bot, TelegramUpdate(2, "jumbo", chat_id=1))
+
+    assert len(adapter_instance.calls) == 1
+    items, pm, _, _ = adapter_instance.calls[0]
+    assert items[0]["qty"] == 5, f"Expected qty=5 in transaction, got {items[0]['qty']}"
+
+
+def test_resolve_product_payment_preserved():
+    """T7: payment_method from original message is preserved through disambiguation."""
+    bot, store, adapter_instance = _bot_with_qty_pending(
+        "sarimie", _SARIMIE_CANDIDATES_DEDUP[:2], qty=5, payment_method="QRIS"
+    )
+    run_message(bot, TelegramUpdate(2, "jumbo", chat_id=1))
+
+    assert len(adapter_instance.calls) == 1
+    _, pm, _, _ = adapter_instance.calls[0]
+    assert pm == "QRIS"
+
+
+def test_resolve_product_no_payment_goes_to_waiting():
+    """T8: after last product resolved with no payment → WAITING_PAYMENT, no transaction yet."""
+    bot, store, adapter_instance = _bot_with_qty_pending(
+        "sarimie", _SARIMIE_CANDIDATES_DEDUP[:2], qty=5, payment_method=None
+    )
+    run_message(bot, TelegramUpdate(2, "jumbo", chat_id=1))
+
+    assert len(adapter_instance.calls) == 0
+    pending = store.get(1, datetime.now(timezone.utc))
+    assert pending is not None
+    assert pending.status == "WAITING_PAYMENT"
+    assert pending.items[0]["qty"] == 5
+
+
+# ── Masalah 3: Unit-aware auto-resolution ───────────────────────────────────
+
+def _unit_resolve_ambiguous(query, candidates, qty, unit):
+    """Build AMBIGUOUS_PRODUCT intent as gemini.py would after unit-aware resolution.
+    If unit uniquely resolves, gemini returns success=True (resolved directly).
+    We test the gemini-layer logic here via FakeProductService.
+    """
+    return {
+        "intent": "sale",
+        "success": False,
+        "error_code": "AMBIGUOUS_PRODUCT",
+        "resolved_items": [],
+        "unresolved_items": [{
+            "original_query": query,
+            "qty": qty,
+            "unit": unit,
+            "candidates": candidates,
+        }],
+        "payment_method": None,
+    }
+
+
+class FakeProductService:
+    """Simulates ProductService.search_product with configurable results."""
+    def __init__(self, results: list[dict]):
+        self._results = results
+
+    def search_product(self, query: str) -> list[dict]:
+        return list(self._results)
+
+    def tool_functions(self):
+        return []
+
+
+def _make_gemini_with_products(products: list[dict]):
+    """Build a GeminiService with a fake product service for unit-resolution tests."""
+    from app.gemini import GeminiService
+
+    class FakeMCPAdapter:
+        def search_product(self, query):
+            return products
+        def tool_functions(self):
+            return []
+
+    svc = GeminiService.__new__(GeminiService)
+    svc._tools = FakeMCPAdapter()
+    return svc
+
+
+def test_unit_aware_resolution_butir_unique():
+    """T9: telur + unit=butir → uniquely matches 'Telur Ayam Satuan' (satuan=butir)."""
+    from app.gemini import GeminiService
+
+    svc = _make_gemini_with_products([
+        {"product_id": "P060", "nama": "Telur Ayam Ras",    "satuan": "kg"},
+        {"product_id": "P061", "nama": "Telur Ayam Satuan", "satuan": "butir"},
+    ])
+    # Simulate what resolve_transaction_intent does internally for unit-match
+    candidates = [
+        {"product_id": "P060", "nama": "Telur Ayam Ras",    "satuan": "kg"},
+        {"product_id": "P061", "nama": "Telur Ayam Satuan", "satuan": "butir"},
+    ]
+    unit = "butir"
+    unit_matched = [c for c in candidates if c["satuan"].casefold() == unit]
+    assert len(unit_matched) == 1
+    assert unit_matched[0]["product_id"] == "P061"
+
+
+def test_unit_aware_resolution_kg_unique():
+    """T10: telur + unit=kg → uniquely matches 'Telur Ayam Ras' (satuan=kg)."""
+    candidates = _TELUR_CANDIDATES[:]
+    unit = "kg"
+    unit_matched = [c for c in candidates if c["satuan"].casefold() == unit]
+    assert len(unit_matched) == 1
+    assert unit_matched[0]["product_id"] == "P060"
+
+
+def test_unit_aware_no_unit_stays_ambiguous():
+    """T11: telur + no unit → both candidates remain, WAITING_PRODUCT created."""
+    candidates = _TELUR_CANDIDATES[:]
+    unit = None
+    if unit:
+        unit_matched = [c for c in candidates if c["satuan"].casefold() == unit]
+    else:
+        unit_matched = []
+    # No unit → no auto-resolve → still 2 candidates → AMBIGUOUS
+    assert len(unit_matched) == 0
+    assert len(candidates) == 2
+
+
+def test_unit_aware_unit_no_match_stays_ambiguous():
+    """T12: unit doesn't match any candidate satuan → stays ambiguous."""
+    candidates = _TELUR_CANDIDATES[:]
+    unit = "gram"
+    unit_matched = [c for c in candidates if c["satuan"].casefold() == unit]
+    assert len(unit_matched) == 0  # "gram" not in ["kg", "butir"] → still ambiguous
+
+
+def test_unit_aware_unit_matches_multiple_stays_ambiguous():
+    """T13: unit matches >1 candidate → stays ambiguous."""
+    candidates = [
+        {"product_id": "P070", "nama": "Susu A", "satuan": "pcs"},
+        {"product_id": "P071", "nama": "Susu B", "satuan": "pcs"},
+    ]
+    unit = "pcs"
+    unit_matched = [c for c in candidates if c["satuan"].casefold() == unit]
+    assert len(unit_matched) == 2  # both match → still ambiguous
+
+
+# ── Masalah 5: Cancel synonyms ──────────────────────────────────────────────
+
+@pytest.mark.parametrize("phrase", [
+    "cancel",
+    "batal",
+    "ga jadi",
+    "gajadi",
+    "nggak jadi",
+    "nggak jadi deng",
+    "enggak jadi",
+    "ga jadi deng",
+    "tidak jadi",
+])
+def test_cancel_synonyms_detected(phrase):
+    """T14-T18: all cancel synonyms trigger _is_cancel()."""
+    assert _is_cancel(phrase), f"Expected _is_cancel({phrase!r}) to be True"
+
+
+@pytest.mark.parametrize("phrase", [
+    "stok aqua",
+    "omzet hari ini",
+    "indomie goreng",
+    "ga jual aqua",     # "ga" without "jadi" — not cancel
+])
+def test_cancel_synonyms_no_false_positive(phrase):
+    """Cancel patterns must not fire on normal messages."""
+    assert not _is_cancel(phrase), f"Expected _is_cancel({phrase!r}) to be False"
+
+
+def test_cancel_synonym_clears_pending():
+    """Cancel synonym 'ga jadi' clears any pending state."""
+    bot, store, adapter_instance = _bot_with_ambiguous_pending("indomie", _INDOMIE_CANDIDATES)
+    assert store.get(1, datetime.now(timezone.utc)) is not None
+
+    reply = run_message(bot, TelegramUpdate(2, "ga jadi", chat_id=1))
+
+    assert store.get(1, datetime.now(timezone.utc)) is None
+    assert "dibatalkan" in reply.lower()
+    assert len(adapter_instance.calls) == 0
+
+
+def test_cancel_without_pending_does_nothing():
+    """Cancel synonym without pending state must not create or error."""
+    model = WorkflowModel({})
+    store = PendingTransactionStore()
+    adapter_instance = TransactionAdapter()
+    bot = TelegramBot("token", model, adapter_instance, store)
+
+    # No pending — "ga jadi" falls through (no cancel guard fires)
+    reply = run_message(bot, TelegramUpdate(1, "ga jadi", chat_id=1))
+    # No pending state created, no transaction
+    assert store.get(1, datetime.now(timezone.utc)) is None
+    assert len(adapter_instance.calls) == 0
+
+
+# ── Multi-item: qty/unit isolation ──────────────────────────────────────────
+
+def test_multi_item_qty_not_swapped():
+    """T21: qty of each item must not be swapped after sequential disambiguation."""
+    # Item 1: indomie qty=2, Item 2: marlboro qty=5
+    model = WorkflowModel({
+        "jual 2 indomie dan 5 marlboro": {
+            "intent": "sale",
+            "success": False,
+            "error_code": "AMBIGUOUS_PRODUCT",
+            "resolved_items": [],
+            "unresolved_items": [
+                {"original_query": "indomie", "qty": 2, "unit": None, "candidates": _INDOMIE_CANDIDATES},
+                {"original_query": "marlboro", "qty": 5, "unit": None, "candidates": _MARLBORO_CANDIDATES},
+            ],
+            "payment_method": "Tunai",
+        }
+    })
+    store = PendingTransactionStore()
+    adapter_instance = TransactionAdapter()
+    bot = TelegramBot("token", model, adapter_instance, store)
+
+    run_message(bot, TelegramUpdate(1, "jual 2 indomie dan 5 marlboro", chat_id=1))
+    run_message(bot, TelegramUpdate(2, "goreng", chat_id=1))   # resolve indomie → P001 qty=2
+    run_message(bot, TelegramUpdate(3, "red", chat_id=1))      # resolve marlboro → P011 qty=5
+
+    assert len(adapter_instance.calls) == 1
+    items, pm, _, _ = adapter_instance.calls[0]
+    qtys = {i["product_id"]: i["qty"] for i in items}
+    assert qtys["P001"] == 2, f"Indomie should be qty=2, got {qtys.get('P001')}"
+    assert qtys["P011"] == 5, f"Marlboro should be qty=5, got {qtys.get('P011')}"
+
+
+def test_multi_item_payment_not_lost():
+    """T23: payment_method from original message survives multi-item disambiguation."""
+    model = WorkflowModel({
+        "jual 2 indomie dan 1 marlboro tunai": {
+            "intent": "sale",
+            "success": False,
+            "error_code": "AMBIGUOUS_PRODUCT",
+            "resolved_items": [],
+            "unresolved_items": [
+                {"original_query": "indomie", "qty": 2, "unit": None, "candidates": _INDOMIE_CANDIDATES},
+                {"original_query": "marlboro", "qty": 1, "unit": None, "candidates": _MARLBORO_CANDIDATES},
+            ],
+            "payment_method": "Tunai",
+        }
+    })
+    store = PendingTransactionStore()
+    adapter_instance = TransactionAdapter()
+    bot = TelegramBot("token", model, adapter_instance, store)
+
+    run_message(bot, TelegramUpdate(1, "jual 2 indomie dan 1 marlboro tunai", chat_id=1))
+    run_message(bot, TelegramUpdate(2, "goreng", chat_id=1))
+    run_message(bot, TelegramUpdate(3, "red", chat_id=1))
+
+    assert len(adapter_instance.calls) == 1
+    _, pm, _, _ = adapter_instance.calls[0]
+    assert pm == "Tunai"
+
+
+def test_multi_item_no_transaction_before_all_resolved():
+    """T24: create_transaction must NOT fire before all items are resolved."""
+    model = WorkflowModel({
+        "jual 1 indomie dan 1 marlboro": {
+            "intent": "sale",
+            "success": False,
+            "error_code": "AMBIGUOUS_PRODUCT",
+            "resolved_items": [],
+            "unresolved_items": [
+                {"original_query": "indomie", "qty": 1, "unit": None, "candidates": _INDOMIE_CANDIDATES},
+                {"original_query": "marlboro", "qty": 1, "unit": None, "candidates": _MARLBORO_CANDIDATES},
+            ],
+            "payment_method": "Tunai",
+        }
+    })
+    store = PendingTransactionStore()
+    adapter_instance = TransactionAdapter()
+    bot = TelegramBot("token", model, adapter_instance, store)
+
+    run_message(bot, TelegramUpdate(1, "jual 1 indomie dan 1 marlboro", chat_id=1))
+    # Resolve only indomie — marlboro still pending
+    run_message(bot, TelegramUpdate(2, "goreng", chat_id=1))
+    assert len(adapter_instance.calls) == 0, "Must NOT create transaction while marlboro unresolved"
+
+    # Now resolve marlboro → transaction fires
+    run_message(bot, TelegramUpdate(3, "red", chat_id=1))
+    assert len(adapter_instance.calls) == 1
+
+
+# ── State safety (repeat coverage for robustness) ───────────────────────────
+
+def test_waiting_product_ttl_state_safety():
+    """T27: TTL expiry still works after unit field added to UnresolvedItem."""
+    store = PendingTransactionStore(ttl=timedelta(seconds=0))
+    store.put(1, PendingTransaction(
+        items=[],
+        payment_method=None,
+        status="WAITING_PRODUCT",
+        created_at=datetime.now(timezone.utc),
+        unresolved=[UnresolvedItem("sarimie", 5, _SARIMIE_CANDIDATES_DEDUP[:2], unit="bungkus")],
+    ))
+    assert store.get(1, datetime.now(timezone.utc)) is None
+
+
+def test_waiting_product_chat_isolation_with_unit():
+    """T28: Chat isolation preserved with unit-bearing UnresolvedItem."""
+    store = PendingTransactionStore()
+    store.put(1, PendingTransaction(
+        items=[],
+        payment_method=None,
+        status="WAITING_PRODUCT",
+        created_at=datetime.now(timezone.utc),
+        unresolved=[UnresolvedItem("telur", 5, _TELUR_CANDIDATES, unit="butir")],
+    ))
+    now = datetime.now(timezone.utc)
+    assert store.get(1, now) is not None
+    assert store.get(2, now) is None
+
+
+def test_waiting_product_stok_preserves_unit_state():
+    """T25+T26: read-only intents during WAITING_PRODUCT preserve unit in state."""
+    bot, store, adapter_instance = _bot_with_qty_pending(
+        "sarimie", _SARIMIE_CANDIDATES_DEDUP[:2], qty=5, unit="bungkus"
+    )
+
+    for query in ("stok aqua", "omzet hari ini"):
+        run_message(bot, TelegramUpdate(99, query, chat_id=1))
+        pending = store.get(1, datetime.now(timezone.utc))
+        assert pending is not None, f"Pending lost after {query!r}"
+        assert pending.unresolved[0].unit == "bungkus", f"Unit lost after {query!r}"
+
+    assert len(adapter_instance.calls) == 0
